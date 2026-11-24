@@ -154,6 +154,7 @@ COLUMNS = [
 def execute(filters=None):
 	"""Entry point for frappe."""
 	data = []
+	message = None
 	if filters and validate(filters):
 		temp, opening = frappe.get_value(
 			"DATEV Settings",
@@ -162,8 +163,37 @@ def execute(filters=None):
 		)
 		filters.update({"against_account": temp, "opening_account": opening or temp})
 		data = get_transactions(filters, as_dict=0)
+		message = get_missing_number_message(filters)
 
-	return COLUMNS, data
+	return COLUMNS, data, message
+
+
+def get_missing_number_message(filters):
+	"""Warn about parties that will be missing from the DATEV master data files."""
+	parties = get_parties_without_number(filters)
+	if not parties:
+		return None
+
+	shown = parties[:20]
+	items = "".join(
+		"<li>{}: {}</li>".format(_(p.party_type), frappe.utils.escape_html(p.party)) for p in shown
+	)
+	more = ""
+	if len(parties) > len(shown):
+		more = "<p>" + _("... and {0} more.").format(len(parties) - len(shown)) + "</p>"
+
+	return (
+		"<p>"
+		+ _(
+			"These Customers and Suppliers have bookings in this period but no Debtor/Creditor Number"
+			" for this company. They will be missing from the DATEV master data files."
+			" Add the number in the Accounts table of each party."
+		)
+		+ "</p><ul>"
+		+ items
+		+ "</ul>"
+		+ more
+	)
 
 
 def validate(filters):
@@ -252,12 +282,12 @@ def get_payment_entry_params(filters):
 
 
 def get_sales_invoice_params(filters):
-	extra_fields = """
+	extra_fields = f"""
 		, '' as 'Beleginfo - Art 5'
 		, '' as 'Beleginfo - Inhalt 5'
 		, '' as 'Beleginfo - Art 6'
 		, '' as 'Beleginfo - Inhalt 6'
-		, si.due_date as 'Fälligkeit'
+		, {get_due_date_field(filters, "si.due_date")} as 'Fälligkeit'
 	"""
 
 	extra_joins = """
@@ -273,12 +303,13 @@ def get_sales_invoice_params(filters):
 
 
 def get_purchase_invoice_params(filters):
-	extra_fields = """
-		, 'Lieferanten-Rechnungsnummer' as 'Beleginfo - Art 5'
+	# DATEV allows max. 20 characters in "Beleginfo - Art"
+	extra_fields = f"""
+		, 'Lieferant-ReNummer' as 'Beleginfo - Art 5'
 		, pi.bill_no as 'Beleginfo - Inhalt 5'
-		, 'Lieferanten-Rechnungsdatum' as 'Beleginfo - Art 6'
+		, 'Lieferant-ReDatum' as 'Beleginfo - Art 6'
 		, pi.bill_date as 'Beleginfo - Inhalt 6'
-		, pi.due_date as 'Fälligkeit'
+		, {get_due_date_field(filters, "pi.due_date")} as 'Fälligkeit'
 	"""
 
 	extra_joins = """
@@ -291,6 +322,18 @@ def get_purchase_invoice_params(filters):
 	"""
 
 	return extra_fields, extra_joins, extra_filters
+
+
+def get_due_date_field(filters, column):
+	"""
+	Return the SQL expression for the column "Fälligkeit".
+
+	This export books against collective accounts, not DATEV personal accounts
+	(OPOS). DATEV warns about every row that has a due date but no OPOS account,
+	so the due date can be left out via DATEV Settings.
+	"""
+	exclude = frappe.db.get_value("DATEV Settings", filters.get("company"), "exclude_due_date")
+	return "''" if exclude else column
 
 
 def get_generic_params(filters):
@@ -346,13 +389,14 @@ def run_query(filters, extra_fields, extra_joins, extra_filters, as_dict=1):
 			'' as 'BU-Schlüssel',
 
 			gl.posting_date as 'Belegdatum',
-			gl.voucher_no as 'Belegfeld 1',
+			LEFT(gl.voucher_no, 36) as 'Belegfeld 1',
 			REPLACE(LEFT(gl.remarks, 60), '\n', ' ') as 'Buchungstext',
-			gl.voucher_type as 'Beleginfo - Art 1',
+			/* DATEV allows max. 20 characters in "Beleginfo - Art" */
+			LEFT(gl.voucher_type, 20) as 'Beleginfo - Art 1',
 			gl.voucher_no as 'Beleginfo - Inhalt 1',
-			gl.against_voucher_type as 'Beleginfo - Art 2',
+			LEFT(gl.against_voucher_type, 20) as 'Beleginfo - Art 2',
 			gl.against_voucher as 'Beleginfo - Inhalt 2',
-			gl.party_type as 'Beleginfo - Art 3',
+			LEFT(gl.party_type, 20) as 'Beleginfo - Art 3',
 			gl.party as 'Beleginfo - Inhalt 3',
 			case gl.party_type when 'Customer' then 'Debitorennummer' when 'Supplier' then 'Kreditorennummer' else NULL end as 'Beleginfo - Art 4',
 			par.debtor_creditor_number as 'Beleginfo - Inhalt 4'
@@ -373,6 +417,8 @@ def run_query(filters, extra_fields, extra_joins, extra_filters, as_dict=1):
 			{extra_joins}
 
 		WHERE gl.company = %(company)s
+		/* cancelled vouchers and their reverse rows are not part of the books */
+		AND gl.is_cancelled = 0
 		AND DATE(gl.posting_date) >= %(from_date)s
 		AND DATE(gl.posting_date) <= %(to_date)s
 
@@ -389,95 +435,67 @@ def run_query(filters, extra_fields, extra_joins, extra_filters, as_dict=1):
 
 def get_customers(filters):
 	"""
-	Get a list of Customers.
+	Get the Customers of the selected company.
 
 	Arguments:
 	filters -- dict of filters to be passed to the sql query
 	"""
-	return frappe.db.sql(
-		"""
-		SELECT
-
-			par.debtor_creditor_number as 'Konto',
-			CASE cus.customer_type
-				WHEN 'Company' THEN cus.customer_name
-				ELSE null
-				END as 'Name (Adressatentyp Unternehmen)',
-			CASE cus.customer_type
-				WHEN 'Individual' THEN TRIM(SUBSTR(cus.customer_name, LOCATE(' ', cus.customer_name)))
-				ELSE null
-				END as 'Name (Adressatentyp natürl. Person)',
-			CASE cus.customer_type
-				WHEN 'Individual' THEN SUBSTRING_INDEX(SUBSTRING_INDEX(cus.customer_name, ' ', 1), ' ', -1)
-				ELSE null
-				END as 'Vorname (Adressatentyp natürl. Person)',
-			CASE cus.customer_type
-				WHEN 'Individual' THEN '1'
-				WHEN 'Company' THEN '2'
-				ELSE '0'
-				END as 'Adressatentyp',
-			adr.address_line1 as 'Straße',
-			adr.pincode as 'Postleitzahl',
-			adr.city as 'Ort',
-			UPPER(country.code) as 'Land',
-			adr.address_line2 as 'Adresszusatz',
-			adr.email_id as 'E-Mail',
-			adr.phone as 'Telefon',
-			adr.fax as 'Fax',
-			cus.website as 'Internet',
-			cus.tax_id as 'Steuernummer'
-
-		FROM `tabCustomer` cus
-
-			left join `tabParty Account` par
-			on par.parent = cus.name
-			and par.parenttype = 'Customer'
-			and par.company = %(company)s
-
-			left join `tabDynamic Link` dyn_adr
-			on dyn_adr.link_name = cus.name
-			and dyn_adr.link_doctype = 'Customer'
-			and dyn_adr.parenttype = 'Address'
-
-			left join `tabAddress` adr
-			on adr.name = dyn_adr.parent
-			and adr.is_primary_address = '1'
-
-			left join `tabCountry` country
-			on country.name = adr.country
-
-		WHERE adr.is_primary_address = '1'
-		""",
-		filters,
-		as_dict=1,
-	)
+	return get_parties(filters, "Customer")
 
 
 def get_suppliers(filters):
 	"""
-	Get a list of Suppliers.
+	Get the Suppliers of the selected company.
 
 	Arguments:
 	filters -- dict of filters to be passed to the sql query
 	"""
+	return get_parties(filters, "Supplier")
+
+
+def get_parties(filters, party_type):
+	"""
+	Get the master data of Customers or Suppliers in DATEV format.
+
+	Only parties with a Debtor/Creditor Number for the selected company are
+	returned. Without that number the party does not belong to this company's
+	DATEV client, and DATEV would reject the row anyway (the account number is
+	mandatory).
+
+	The address is the party's primary address. If there is none, another
+	enabled address is used (billing addresses first). Parties without any
+	address are exported without address fields.
+
+	Arguments:
+	filters -- dict of filters to be passed to the sql query
+	party_type -- "Customer" or "Supplier"
+	"""
+	if party_type not in ("Customer", "Supplier"):
+		frappe.throw(_("Invalid party type: {0}").format(party_type))
+
+	prefix = party_type.lower()
+	extra_fields = ""
+	if party_type == "Supplier":
+		extra_fields = ", case party.on_hold when 1 then party.release_date else null end as 'Zahlungssperre bis'"
+
 	return frappe.db.sql(
-		"""
+		f"""
 		SELECT
 
 			par.debtor_creditor_number as 'Konto',
-			CASE sup.supplier_type
-				WHEN 'Company' THEN sup.supplier_name
+			CASE party.{prefix}_type
+				WHEN 'Company' THEN party.{prefix}_name
 				ELSE null
 				END as 'Name (Adressatentyp Unternehmen)',
-			CASE sup.supplier_type
-				WHEN 'Individual' THEN TRIM(SUBSTR(sup.supplier_name, LOCATE(' ', sup.supplier_name)))
+			CASE party.{prefix}_type
+				WHEN 'Individual' THEN TRIM(SUBSTR(party.{prefix}_name, LOCATE(' ', party.{prefix}_name)))
 				ELSE null
 				END as 'Name (Adressatentyp natürl. Person)',
-			CASE sup.supplier_type
-				WHEN 'Individual' THEN SUBSTRING_INDEX(SUBSTRING_INDEX(sup.supplier_name, ' ', 1), ' ', -1)
+			CASE party.{prefix}_type
+				WHEN 'Individual' THEN SUBSTRING_INDEX(SUBSTRING_INDEX(party.{prefix}_name, ' ', 1), ' ', -1)
 				ELSE null
 				END as 'Vorname (Adressatentyp natürl. Person)',
-			CASE sup.supplier_type
+			CASE party.{prefix}_type
 				WHEN 'Individual' THEN '1'
 				WHEN 'Company' THEN '2'
 				ELSE '0'
@@ -490,30 +508,67 @@ def get_suppliers(filters):
 			adr.email_id as 'E-Mail',
 			adr.phone as 'Telefon',
 			adr.fax as 'Fax',
-			sup.website as 'Internet',
-			sup.tax_id as 'Steuernummer',
-			case sup.on_hold when 1 then sup.release_date else null end as 'Zahlungssperre bis'
+			party.website as 'Internet',
+			party.tax_id as 'Steuernummer'
+			{extra_fields}
 
-		FROM `tabSupplier` sup
+		FROM `tab{party_type}` party
 
-			left join `tabParty Account` par
-			on par.parent = sup.name
-			and par.parenttype = 'Supplier'
-			and par.company = %(company)s
+			/* only parties that have a Debtor/Creditor Number for this company */
+			INNER JOIN `tabParty Account` par
+			ON par.parent = party.name
+			AND par.parenttype = %(party_type)s
+			AND par.company = %(company)s
+			AND IFNULL(par.debtor_creditor_number, '') != ''
 
-			left join `tabDynamic Link` dyn_adr
-			on dyn_adr.link_name = sup.name
-			and dyn_adr.link_doctype = 'Supplier'
-			and dyn_adr.parenttype = 'Address'
+			/* exactly one address: primary first, then billing, then the oldest */
+			LEFT JOIN `tabAddress` adr
+			ON adr.name = (
+				SELECT a.name
+				FROM `tabAddress` a
+				INNER JOIN `tabDynamic Link` dl
+				ON dl.parent = a.name
+				AND dl.parenttype = 'Address'
+				AND dl.link_doctype = %(party_type)s
+				AND dl.link_name = party.name
+				WHERE a.disabled = 0
+				ORDER BY a.is_primary_address DESC, (a.address_type = 'Billing') DESC, a.creation ASC
+				LIMIT 1
+			)
 
-			left join `tabAddress` adr
-			on adr.name = dyn_adr.parent
-			and adr.is_primary_address = '1'
+			LEFT JOIN `tabCountry` country
+			ON country.name = adr.country
 
-			left join `tabCountry` country
-			on country.name = adr.country
+		ORDER BY par.debtor_creditor_number
+		""",
+		dict(filters, party_type=party_type),
+		as_dict=1,
+	)
 
-		WHERE adr.is_primary_address = '1'
+
+def get_parties_without_number(filters):
+	"""
+	Return Customers and Suppliers that have ledger entries in the selected
+	period but no Debtor/Creditor Number for the selected company.
+
+	These parties are missing from the DATEV master data files.
+	"""
+	return frappe.db.sql(
+		"""
+		SELECT DISTINCT gl.party_type, gl.party
+		FROM `tabGL Entry` gl
+		LEFT JOIN `tabParty Account` par
+		ON par.parent = gl.party
+		AND par.parenttype = gl.party_type
+		AND par.company = gl.company
+		WHERE gl.company = %(company)s
+		AND gl.is_cancelled = 0
+		AND gl.party_type IN ('Customer', 'Supplier')
+		AND IFNULL(gl.party, '') != ''
+		AND DATE(gl.posting_date) >= %(from_date)s
+		AND DATE(gl.posting_date) <= %(to_date)s
+		AND IFNULL(par.debtor_creditor_number, '') = ''
+		ORDER BY gl.party_type, gl.party
 		""",
 		filters,
 		as_dict=1,
