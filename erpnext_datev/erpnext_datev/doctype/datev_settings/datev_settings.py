@@ -19,6 +19,7 @@ class DATEVSettings(Document):
 		client_number: DF.Data
 		consultant: DF.Link | None
 		consultant_number: DF.Data
+		exclude_due_date: DF.Check
 		opening_against_account_number: DF.Data | None
 		temporary_against_account_number: DF.Data
 	# end: auto-generated types

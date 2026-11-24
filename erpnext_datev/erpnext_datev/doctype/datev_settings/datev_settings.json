@@ -16,7 +16,8 @@
   "account_number_length",
   "column_break_6",
   "temporary_against_account_number",
-  "opening_against_account_number"
+  "opening_against_account_number",
+  "exclude_due_date"
  ],
  "fields": [
   {
@@ -85,11 +86,18 @@
    "fieldname": "opening_against_account_number",
    "fieldtype": "Data",
    "label": "Opening Against Account Number"
+  },
+  {
+   "default": "1",
+   "description": "Leave the column \"Fälligkeit\" empty. This export does not use DATEV personal accounts (OPOS), so DATEV would show a warning for every row with a due date.",
+   "fieldname": "exclude_due_date",
+   "fieldtype": "Check",
+   "label": "Exclude Due Date"
   }
  ],
  "grid_page_length": 50,
  "links": [],
- "modified": "2026-07-27 23:03:02.739110",
+ "modified": "2026-11-24 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "Erpnext Datev",
  "name": "DATEV Settings",

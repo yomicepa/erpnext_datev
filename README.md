@@ -27,6 +27,16 @@ Integration between [ERPNext](https://github.com/frappe/erpnext) and DATEV.
 
     Now you can use the report "DATEV". This is a preview of the transactions data. It can be exported, along with the master data, as zip file via the report's menu. Your tax xonsultant can then import your GL Entries into his DATEV system.
 
+3. What is exported
+
+    - Only GL Entries that are not cancelled. A cancelled voucher and its reverse rows are left out, so the export matches the ledger reports.
+    - Customers and Suppliers that have a **Debtor/Creditor Number** for the exported company (in the _Accounts_ table of the party). Parties of other companies are not exported. The report shows a warning for parties that have bookings in the period but no number.
+    - The party's primary address. If there is none, another address is used. Parties without an address are exported without address fields.
+    - The due date ("Fälligkeit") only if _Exclude Due Date_ is unchecked in **DATEV Settings** (checked by default). This export does not use DATEV personal accounts (OPOS), so DATEV warns about every row with a due date.
+
+> [!IMPORTANT]
+> If a voucher was already imported into DATEV and is cancelled later in ERPNext, the next export does **not** contain a reversal: the original rows are dated in the old period and cancelled rows are skipped. Enable _Enable Immutable Ledger_ in **Accounts Settings**, so that a cancellation posts reverse entries on the cancellation date, which are exported with the next period. Alternatively, do not cancel; post a reversing **Journal Entry** instead.
+
 > [!IMPORTANT]
 > ERPNext does not have automatic VAT deduction ("Automatikkonten") on the GL Entry level. By using the default against account "9090", the automation is disabled.
 > 
